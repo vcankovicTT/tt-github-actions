@@ -96,6 +96,226 @@ def test_parse_parameter_support_tests(sample_parameter_support_json):
     assert tests[2].tags["type"] == "parameter_support_test"
 
 
+@pytest.fixture
+def sample_spec_tests_sections_json():
+    """A v2 report: spec test results as sections[] blocks, as tt-inference-server emits them."""
+    data = {
+        "metadata": {
+            "model_name": "google/diffusiongemma-26B-A4B-it",
+            "device": "P300X2",
+            "model_impl": "diffusion-gemma",
+            "generated_at": "2026-08-27T20:20:49+00:00",
+        },
+        "sections": [
+            {
+                "kind": "benchmarks",
+                "data": {"mean_ttft_ms": 12350.428},
+                "title": "vLLM Benchmark",
+            },
+            {
+                "kind": "spec_tests",
+                "task_type": "unit",
+                "title": "Logger Fork Safety",
+                "data": {
+                    "success": True,
+                    "child_result": "OK",
+                    "status": "pass",
+                    "elapsed_seconds": 0.028281036764383316,
+                    "test_name": "LoggerForkSafetyTest",
+                    "description": "Test for logging fork safety to prevent deadlocks",
+                },
+            },
+            {
+                "kind": "spec_tests",
+                "task_type": "functional",
+                "title": "Vllm Diffusiongemma",
+                "data": {
+                    "endpoint_url": "http://127.0.0.1:8000/v1/chat/completions",
+                    "model_name": "google/diffusiongemma-26B-A4B-it",
+                    "detailed_test_results": [
+                        {
+                            "test_case": "test_exact_context_and_canvas_fit",
+                            "parametrization": "test_exact_context_and_canvas_fit",
+                            "status": "✅ PASSED",
+                            "message": "",
+                        },
+                        {
+                            "test_case": "test_unsupported_response_parameter",
+                            "parametrization": "test_unsupported_response_parameter[n-2]",
+                            "status": "❌ FAILED",
+                            "message": "n=2 not supported",
+                        },
+                        {
+                            "test_case": "test_optional_capability",
+                            "parametrization": "test_optional_capability",
+                            "status": "➖ SKIPPED",
+                            "message": "not applicable on this device",
+                        },
+                    ],
+                    "success": True,
+                    "status": "pass",
+                    "elapsed_seconds": 199.57880044076592,
+                    "test_name": "VLLMDiffusionGemmaParamConformanceTest",
+                },
+            },
+        ],
+    }
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        json.dump(data, f)
+        temp_path = f.name
+
+    yield temp_path
+
+    Path(temp_path).unlink()
+
+
+def test_can_parse_spec_tests_sections(sample_spec_tests_sections_json):
+    parser = ParameterSupportTestParser()
+    assert parser.can_parse(sample_spec_tests_sections_json) is True
+
+
+def test_cannot_parse_report_without_spec_tests_sections():
+    """A report carrying only benchmark/eval sections is not ours to parse."""
+    data = {
+        "metadata": {"model_name": "Qwen3-32B"},
+        "sections": [{"kind": "benchmarks", "data": {"mean_ttft_ms": 1.0}}],
+    }
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        json.dump(data, f)
+        temp_path = f.name
+
+    try:
+        parser = ParameterSupportTestParser()
+        assert parser.can_parse(temp_path) is False
+    finally:
+        Path(temp_path).unlink()
+
+
+def test_parse_spec_tests_sections(sample_spec_tests_sections_json):
+    parser = ParameterSupportTestParser()
+    tests = parser.parse(sample_spec_tests_sections_json)
+
+    # 1 suite-level block (no per-test breakdown) + 3 detailed results
+    assert len(tests) == 4
+
+    suite = tests[0]
+    assert suite.test_case_name == "LoggerForkSafetyTest"
+    assert suite.group == "LoggerForkSafetyTest"
+    assert suite.full_test_name == "LoggerForkSafetyTest"
+    assert suite.success is True
+    assert suite.skipped is False
+    assert suite.error_message is None
+    assert suite.category == "parameter_support"
+    assert suite.owner == "tt-shield"
+    assert suite.tags["type"] == "parameter_support_test"
+
+
+def test_glyph_prefixed_statuses_are_understood(sample_spec_tests_sections_json):
+    """v2 renders statuses as '✅ PASSED' — a bare .lower() would mark every test failed."""
+    parser = ParameterSupportTestParser()
+    tests = parser.parse(sample_spec_tests_sections_json)
+    by_name = {t.test_case_name: t for t in tests}
+
+    passed = by_name["test_exact_context_and_canvas_fit"]
+    assert passed.success is True
+    assert passed.skipped is False
+    assert passed.error_message is None
+
+    failed = by_name["test_unsupported_response_parameter[n-2]"]
+    assert failed.success is False
+    assert failed.skipped is False
+    assert failed.error_message == "n=2 not supported"
+
+    skipped = by_name["test_optional_capability"]
+    assert skipped.success is False
+    assert skipped.skipped is True
+    assert skipped.error_message == "not applicable on this device"
+
+
+def test_spec_tests_sections_naming_and_config(sample_spec_tests_sections_json):
+    parser = ParameterSupportTestParser()
+    tests = parser.parse(sample_spec_tests_sections_json)
+    by_name = {t.test_case_name: t for t in tests}
+
+    case = by_name["test_unsupported_response_parameter[n-2]"]
+    assert case.group == "VLLMDiffusionGemmaParamConformanceTest"
+    assert case.full_test_name == ("VLLMDiffusionGemmaParamConformanceTest::test_unsupported_response_parameter[n-2]")
+    # Metadata supplies model/device/impl; the block supplies the endpoint.
+    assert case.config["model_name"] == "google/diffusiongemma-26B-A4B-it"
+    assert case.config["device"] == "P300X2"
+    assert case.config["model_impl"] == "diffusion-gemma"
+    assert case.config["endpoint_url"] == "http://127.0.0.1:8000/v1/chat/completions"
+
+
+def test_spec_tests_sections_derive_timestamps_from_report(sample_spec_tests_sections_json):
+    """Timestamps come from generated_at minus the block's elapsed time, not the 9999 sentinel."""
+    parser = ParameterSupportTestParser()
+    tests = parser.parse(sample_spec_tests_sections_json)
+    by_name = {t.test_case_name: t for t in tests}
+
+    suite = by_name["LoggerForkSafetyTest"]
+    assert suite.test_end_ts.year == 2026
+    assert suite.test_start_ts.year == 2026
+    assert suite.test_start_ts <= suite.test_end_ts
+
+    # The 199.6s block starts meaningfully before it ends.
+    case = by_name["test_exact_context_and_canvas_fit"]
+    assert (case.test_end_ts - case.test_start_ts).total_seconds() == pytest.approx(199.58, abs=0.01)
+
+
+def test_spec_tests_sections_without_generated_at_fall_back_to_sentinel():
+    data = {
+        "metadata": {"model_name": "Qwen3-32B"},
+        "sections": [
+            {
+                "kind": "spec_tests",
+                "data": {"status": "pass", "success": True, "test_name": "LoggerForkSafetyTest"},
+            }
+        ],
+    }
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        json.dump(data, f)
+        temp_path = f.name
+
+    try:
+        parser = ParameterSupportTestParser()
+        tests = parser.parse(temp_path)
+        assert len(tests) == 1
+        assert tests[0].test_start_ts.year == 9999
+        assert tests[0].success is True
+    finally:
+        Path(temp_path).unlink()
+
+
+def test_suite_block_falls_back_to_success_flag_when_status_missing():
+    """Blocks that report only a boolean still resolve correctly."""
+    data = {
+        "metadata": {"model_name": "Qwen3-32B", "generated_at": "2026-08-27T20:20:49+00:00"},
+        "sections": [
+            {
+                "kind": "spec_tests",
+                "data": {"success": False, "test_name": "BrokenSuite", "child_result": "child exited 1"},
+            }
+        ],
+    }
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        json.dump(data, f)
+        temp_path = f.name
+
+    try:
+        parser = ParameterSupportTestParser()
+        tests = parser.parse(temp_path)
+        assert len(tests) == 1
+        assert tests[0].success is False
+        assert tests[0].error_message == "child exited 1"
+    finally:
+        Path(temp_path).unlink()
+
+
 def test_parse_empty_results():
     data = {"parameter_support_tests": {"endpoint_url": "http://test", "model_name": "test_model", "results": {}}}
 
